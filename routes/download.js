@@ -6,11 +6,19 @@ const { requireToken } = require('./license');
 const router = express.Router();
 const RELEASES_DIR = path.resolve(process.env.RELEASES_DIR || './releases');
 
-// Si está configurada, los archivos grandes se sirven proxeando desde GitHub Releases
+// Si está configurado, los archivos grandes se sirven proxeando desde GitHub Releases
 // en vez de buscarlos en el disco local (útil en hostings como Railway que no tienen
-// espacio persistente grande). Formato esperado, ej:
-// GITHUB_RELEASES_BASE_URL=https://github.com/propelfundingflow-ops/pilla-pilla-server/releases/download/v1.0.0
-const GITHUB_RELEASES_BASE_URL = process.env.GITHUB_RELEASES_BASE_URL;
+// espacio persistente grande para builds de varios GB).
+//
+// IMPORTANTE: la URL se construye usando el "version" que manda el launcher,
+// así que cada release tiene que subirse a GitHub como un Release con el tag
+// "v<version>" (ej. versión "2.4.0" -> tag "v2.4.0"). Antes esta URL venía
+// completa (con la versión ya incrustada) desde una sola variable de entorno,
+// así que SIEMPRE se descargaba del mismo tag sin importar qué versión
+// publicaras nueva en el manifest. Ahora solo hace falta el repo:
+//
+// GITHUB_RELEASES_REPO=propelfundingflow-ops/pilla-pilla-server
+const GITHUB_RELEASES_REPO = process.env.GITHUB_RELEASES_REPO;
 
 // GET /api/game/download?version=1.0.0&file=ruta/relativa/al/archivo
 router.get('/download', requireToken, async (req, res) => {
@@ -20,8 +28,10 @@ router.get('/download', requireToken, async (req, res) => {
   }
 
   // Opción 1: proxear desde GitHub Releases (archivos grandes)
-  if (GITHUB_RELEASES_BASE_URL) {
-    const remoteUrl = `${GITHUB_RELEASES_BASE_URL}/${encodeURIComponent(file)}`;
+  if (GITHUB_RELEASES_REPO) {
+    const remoteUrl = `https://github.com/${GITHUB_RELEASES_REPO}/releases/download/v${encodeURIComponent(
+      version
+    )}/${encodeURIComponent(file)}`;
     try {
       const upstream = await fetch(remoteUrl);
       if (!upstream.ok || !upstream.body) {
