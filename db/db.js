@@ -109,6 +109,45 @@ CREATE TABLE IF NOT EXISTS premium_orders (
 
 CREATE INDEX IF NOT EXISTS idx_premium_orders_status ON premium_orders(status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_premium_orders_license ON premium_orders(license_id);
+
+-- Clanes (guilds). Un jugador solo puede pertenecer a un clan a la vez (ver
+-- guild_members, que tiene license_id como PRIMARY KEY). El líder es el
+-- fundador del clan; puede expulsar miembros y, si se va, el clan pasa al
+-- miembro más antiguo (ver routes/guild.js::leave).
+CREATE TABLE IF NOT EXISTS guilds (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  tag TEXT NOT NULL,                 -- 2-5 letras/números, se muestra junto al nombre del jugador
+  description TEXT NOT NULL DEFAULT '',
+  leader_license_id INTEGER NOT NULL REFERENCES licenses(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Un jugador solo puede estar en un clan a la vez: license_id como clave
+-- primaria (no autoincremental) impone justo esa regla a nivel de esquema.
+CREATE TABLE IF NOT EXISTS guild_members (
+  license_id INTEGER PRIMARY KEY REFERENCES licenses(id),
+  guild_id INTEGER NOT NULL REFERENCES guilds(id),
+  joined_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Chat de clan: mensajes simples, se leen por polling (GET con ?after=id)
+-- desde el cliente mientras la pantalla de clan está abierta.
+-- license_id se deja NULL para mensajes de sistema (alguien se une, se
+-- expulsa a alguien, cambia el líder...), que no pertenecen a ningún
+-- jugador concreto. Los mensajes normales de chat siempre llevan license_id.
+CREATE TABLE IF NOT EXISTS guild_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id INTEGER NOT NULL REFERENCES guilds(id),
+  license_id INTEGER REFERENCES licenses(id),
+  username TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_guilds_tag ON guilds(tag);
+CREATE INDEX IF NOT EXISTS idx_guild_members_guild ON guild_members(guild_id);
+CREATE INDEX IF NOT EXISTS idx_guild_messages_guild ON guild_messages(guild_id, id);
 `);
 
 // Migración: la tabla player_stats se creó antes de que existiera la tienda.
