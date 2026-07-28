@@ -13,6 +13,7 @@ const downloadRoutes = require('./routes/download');
 const playerRoutes = require('./routes/player');
 const shopRoutes = require('./routes/shop');
 const adminRoutes = require('./routes/admin');
+const guildRoutes = require('./routes/guild');
 
 const app = express();
 app.use(express.json());
@@ -37,6 +38,7 @@ app.use('/api/game', downloadRoutes);
 app.use('/api/player', playerRoutes);
 app.use('/api/shop', shopRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/guild', guildRoutes);
 
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'pilla-pilla-server' });
