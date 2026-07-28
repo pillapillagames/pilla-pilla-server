@@ -148,6 +148,55 @@ CREATE TABLE IF NOT EXISTS guild_messages (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_guilds_tag ON guilds(tag);
 CREATE INDEX IF NOT EXISTS idx_guild_members_guild ON guild_members(guild_id);
 CREATE INDEX IF NOT EXISTS idx_guild_messages_guild ON guild_messages(guild_id, id);
+
+-- Invitaciones a partida amistosa. El host manda su IP/puerto; el invitado
+-- las recibe por polling (igual que el chat de clan) y, si acepta, el
+-- cliente llama directamente a Network.join_game(hostIp) con esos datos.
+-- No hay servidor de relay: sigue siendo conexión ENet directa, esto solo
+-- automatiza el "pásame tu IP por WhatsApp" de antes. status pasa de
+-- 'pending' a 'accepted' o 'declined'; las que llevan mucho sin respuesta
+-- se consideran caducadas y se ignoran (ver EXPIRATION en routes/battle.js).
+CREATE TABLE IF NOT EXISTS game_invites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_license_id INTEGER NOT NULL REFERENCES licenses(id),
+  to_license_id INTEGER NOT NULL REFERENCES licenses(id),
+  host_ip TEXT NOT NULL,
+  host_port INTEGER NOT NULL DEFAULT 8910,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | accepted | declined
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_game_invites_to ON game_invites(to_license_id, status);
+
+-- Amistades. Una fila por par de jugadores. status 'pending' hasta que el
+-- destinatario la acepta ('accepted'); si la rechaza, se borra la fila
+-- directamente (no queda historial de rechazos). requester/addressee son
+-- direccionales (quién la mandó), pero una vez 'accepted' la relación es
+-- simétrica a efectos de la app (cualquiera de los dos ve al otro como amigo).
+CREATE TABLE IF NOT EXISTS friendships (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  requester_id INTEGER NOT NULL REFERENCES licenses(id),
+  addressee_id INTEGER NOT NULL REFERENCES licenses(id),
+  status TEXT NOT NULL DEFAULT 'pending', -- pending | accepted
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  responded_at TEXT
+);
+
+-- Historial de envíos de monedas entre jugadores (amigos o compañeros de
+-- clan). Sirve tanto de auditoría como para poder mostrar "movimientos
+-- recientes" en el futuro si hiciera falta.
+CREATE TABLE IF NOT EXISTS coin_transfers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_license_id INTEGER NOT NULL REFERENCES licenses(id),
+  to_license_id INTEGER NOT NULL REFERENCES licenses(id),
+  amount INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_friendships_requester ON friendships(requester_id, status);
+CREATE INDEX IF NOT EXISTS idx_friendships_addressee ON friendships(addressee_id, status);
+CREATE INDEX IF NOT EXISTS idx_coin_transfers_to ON coin_transfers(to_license_id);
+CREATE INDEX IF NOT EXISTS idx_coin_transfers_from ON coin_transfers(from_license_id);
 `);
 
 // Migración: la tabla player_stats se creó antes de que existiera la tienda.
@@ -195,6 +244,32 @@ if (!playerStatsColumns.includes('tournament_wins')) {
 if (!playerStatsColumns.includes('tournament_matches')) {
   db.exec("ALTER TABLE player_stats ADD COLUMN tournament_matches INTEGER NOT NULL DEFAULT 0");
   console.log('Migración aplicada: columna tournament_matches añadida a player_stats');
+}
+
+// Migración: banco de monedas y nivel del clan. Los clanes que ya existían
+// arrancan en nivel 1, banco a 0 y xp a 0 (no hay nada que migrar: es
+// funcionalidad nueva). El banco sube con las donaciones de los miembros
+// (ver POST /api/guild/donate) y determina el nivel del clan.
+const guildsColumns = db.prepare("PRAGMA table_info(guilds)").all().map((c) => c.name);
+if (!guildsColumns.includes('bank_coins')) {
+  db.exec("ALTER TABLE guilds ADD COLUMN bank_coins INTEGER NOT NULL DEFAULT 0");
+  console.log('Migración aplicada: columna bank_coins añadida a guilds');
+}
+if (!guildsColumns.includes('level')) {
+  db.exec("ALTER TABLE guilds ADD COLUMN level INTEGER NOT NULL DEFAULT 1");
+  console.log('Migración aplicada: columna level añadida a guilds');
+}
+if (!guildsColumns.includes('xp')) {
+  db.exec("ALTER TABLE guilds ADD COLUMN xp INTEGER NOT NULL DEFAULT 0");
+  console.log('Migración aplicada: columna xp añadida a guilds');
+}
+
+// Migración: cuánto ha donado cada miembro en total (para poder mostrar un
+// ranking de donantes dentro del clan más adelante si hace falta).
+const guildMembersColumns = db.prepare("PRAGMA table_info(guild_members)").all().map((c) => c.name);
+if (!guildMembersColumns.includes('total_donated')) {
+  db.exec("ALTER TABLE guild_members ADD COLUMN total_donated INTEGER NOT NULL DEFAULT 0");
+  console.log('Migración aplicada: columna total_donated añadida a guild_members');
 }
 
 // Migración: marca de "ya se hizo la sincronización única" de /api/player/sync.
