@@ -4,14 +4,29 @@ const { requireToken } = require('./license');
 
 const router = express.Router();
 
-// Límites de la funcionalidad. MAX_MEMBERS es generoso pero acotado para que
-// un clan no crezca sin control; CHAT_HISTORY_LIMIT evita mandar historiales
-// gigantes cada vez que se abre la pantalla.
-const MAX_MEMBERS = 50;
+// Límites de la funcionalidad. El tope de miembros escala con el nivel del
+// clan (ver maxMembersForLevel) pero sigue acotado para que no crezca sin
+// control; CHAT_HISTORY_LIMIT evita mandar historiales gigantes cada vez que
+// se abre la pantalla.
+const MAX_MEMBERS_BASE = 50;
+const MAX_MEMBERS_CAP = 80;
+const MAX_MEMBERS_PER_LEVEL = 2; // cada nivel de clan añade 2 huecos más, hasta el tope
 const NAME_REGEX = /^.{3,24}$/; // longitud libre de contenido, 3-24 caracteres
 const TAG_REGEX = /^[a-zA-Z0-9]{2,5}$/; // 2-5 letras/números, sin espacios ni símbolos
 const CHAT_HISTORY_LIMIT = 50;
 const MESSAGE_MAX_LENGTH = 200;
+const MAX_DONATION = 100000; // límite defensivo por donación individual
+
+// Cuánta xp hace falta para pasar del nivel `level` al siguiente. Sube según
+// el propio nivel para que cada nivel cueste un poco más que el anterior.
+function xpToNextLevel(level) {
+  return level * 500;
+}
+
+// Cuántos miembros caben en un clan de nivel `level` (con tope superior).
+function maxMembersForLevel(level) {
+  return Math.min(MAX_MEMBERS_BASE + (level - 1) * MAX_MEMBERS_PER_LEVEL, MAX_MEMBERS_CAP);
+}
 
 function getUsername(licenseId) {
   const row = db.prepare('SELECT username FROM player_stats WHERE license_id = ?').get(licenseId);
@@ -38,7 +53,11 @@ function guildPayload(guild) {
     description: guild.description,
     leaderLicenseId: guild.leader_license_id,
     memberCount: memberCount(guild.id),
-    maxMembers: MAX_MEMBERS,
+    maxMembers: maxMembersForLevel(guild.level),
+    level: guild.level,
+    xp: guild.xp,
+    xpToNextLevel: xpToNextLevel(guild.level),
+    bankCoins: guild.bank_coins,
     createdAt: guild.created_at,
   };
 }
@@ -136,7 +155,7 @@ router.post('/join', requireToken, (req, res) => {
   if (!guild) {
     return res.status(404).json({ ok: false, error: 'Ese clan ya no existe.' });
   }
-  if (memberCount(guildId) >= MAX_MEMBERS) {
+  if (memberCount(guildId) >= maxMembersForLevel(guild.level)) {
     return res.status(400).json({ ok: false, error: 'Ese clan ya está completo.' });
   }
 
@@ -214,6 +233,69 @@ router.post('/kick', requireToken, (req, res) => {
   ).run(guild.id, `${username} ha sido expulsado del clan.`);
 
   res.json({ ok: true, guild: guildPayload(guild), members: membersPayload(guild.id) });
+});
+
+// POST /api/guild/donate  body: { amount }  (requiere token, requiere estar en un clan)
+// Descuenta `amount` monedas al jugador y las suma al banco del clan; esa
+// misma cantidad cuenta como xp de clan (1 moneda donada = 1 xp), y el clan
+// sube de nivel automáticamente cuando alcanza el umbral (puede subir varios
+// niveles de golpe si la donación es grande). El banco del clan es acumulado
+// y no se gasta al subir de nivel: solo la xp se consume nivel a nivel.
+router.post('/donate', requireToken, (req, res) => {
+  const amount = Math.trunc(Number(req.body?.amount));
+  if (!Number.isInteger(amount) || amount <= 0 || amount > MAX_DONATION) {
+    return res.status(400).json({ ok: false, error: `La donación debe ser un número entero entre 1 y ${MAX_DONATION}.` });
+  }
+
+  const membership = getMembership(req.license.id);
+  if (!membership) {
+    return res.status(400).json({ ok: false, error: 'No perteneces a ningún clan.' });
+  }
+
+  const stats = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
+  if (!stats || stats.coins < amount) {
+    return res.status(400).json({ ok: false, error: 'No tienes monedas suficientes.' });
+  }
+
+  let guild = getGuildById(membership.guild_id);
+  if (!guild) {
+    return res.status(404).json({ ok: false, error: 'Tu clan ya no existe.' });
+  }
+
+  // Sube de nivel tantas veces como haga falta con la xp acumulada (por si
+  // dona de golpe una cantidad grande que cubre varios niveles seguidos).
+  let level = guild.level;
+  let xp = guild.xp + amount;
+  while (xp >= xpToNextLevel(level)) {
+    xp -= xpToNextLevel(level);
+    level += 1;
+  }
+
+  db.prepare('UPDATE player_stats SET coins = coins - ?, updated_at = datetime(\'now\') WHERE license_id = ?').run(
+    amount,
+    req.license.id
+  );
+  db.prepare('UPDATE guilds SET bank_coins = bank_coins + ?, level = ?, xp = ? WHERE id = ?').run(
+    amount,
+    level,
+    xp,
+    guild.id
+  );
+  db.prepare('UPDATE guild_members SET total_donated = total_donated + ? WHERE license_id = ?').run(
+    amount,
+    req.license.id
+  );
+
+  if (level > guild.level) {
+    const username = getUsername(req.license.id);
+    db.prepare(
+      `INSERT INTO guild_messages (guild_id, license_id, username, message) VALUES (?, NULL, 'Sistema', ?)`
+    ).run(guild.id, `${username} ha donado ${amount} monedas. ¡El clan ha subido a nivel ${level}!`);
+  }
+
+  guild = getGuildById(guild.id);
+  const newCoins = stats.coins - amount;
+  res.json({ ok: true, guild: guildPayload(guild), coins: newCoins });
 });
 
 // GET /api/guild/chat?after=0  (requiere token)

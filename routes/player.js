@@ -562,4 +562,80 @@ router.post('/claim-tournament-milestone', requireToken, (req, res) => {
   res.json({ ok: true, coins: newCoins, unlockedSkins: unlocked, tournamentClaimed: claimed });
 });
 
+const MAX_SEND_AMOUNT = 100000; // límite defensivo por envío
+
+// ¿Puede `fromId` mandarle monedas a `toId`? Solo si son amigos aceptados o
+// compañeros del mismo clan (evita que cualquiera le mande monedas a
+// cualquiera sin relación, que abriría la puerta a farmear cuentas alt).
+function canSendCoins(fromId, toId) {
+  const friend = db
+    .prepare(
+      `SELECT 1 FROM friendships
+       WHERE status = 'accepted'
+         AND ((requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?))`
+    )
+    .get(fromId, toId, toId, fromId);
+  if (friend) return true;
+
+  const sameClan = db
+    .prepare(
+      `SELECT 1 FROM guild_members a
+       JOIN guild_members b ON a.guild_id = b.guild_id
+       WHERE a.license_id = ? AND b.license_id = ?`
+    )
+    .get(fromId, toId);
+  return !!sameClan;
+}
+
+// POST /api/player/send-coins  body: { username, amount }  (requiere token)
+// Manda monedas a otro jugador por su nombre de usuario. Solo permitido
+// entre amigos o miembros del mismo clan (ver canSendCoins).
+router.post('/send-coins', requireToken, (req, res) => {
+  const username = (req.body?.username || '').toString().trim();
+  const amount = Math.trunc(Number(req.body?.amount));
+
+  if (username === '') {
+    return res.status(400).json({ ok: false, error: 'Escribe el nombre de usuario del destinatario.' });
+  }
+  if (!Number.isInteger(amount) || amount <= 0 || amount > MAX_SEND_AMOUNT) {
+    return res.status(400).json({ ok: false, error: `La cantidad debe ser un número entero entre 1 y ${MAX_SEND_AMOUNT}.` });
+  }
+
+  const target = db.prepare('SELECT license_id FROM player_stats WHERE username = ? COLLATE NOCASE').get(username);
+  if (!target) {
+    return res.status(404).json({ ok: false, error: 'No se encontró ningún jugador con ese nombre.' });
+  }
+  if (target.license_id === req.license.id) {
+    return res.status(400).json({ ok: false, error: 'No puedes mandarte monedas a ti mismo.' });
+  }
+  if (!canSendCoins(req.license.id, target.license_id)) {
+    return res.status(403).json({ ok: false, error: 'Solo puedes mandar monedas a amigos o compañeros de clan.' });
+  }
+
+  const stats = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
+  if (!stats || stats.coins < amount) {
+    return res.status(400).json({ ok: false, error: 'No tienes monedas suficientes.' });
+  }
+
+  const tx = db.transaction(() => {
+    db.prepare(`UPDATE player_stats SET coins = coins - ?, updated_at = datetime('now') WHERE license_id = ?`).run(
+      amount,
+      req.license.id
+    );
+    db.prepare(`UPDATE player_stats SET coins = coins + ?, updated_at = datetime('now') WHERE license_id = ?`).run(
+      amount,
+      target.license_id
+    );
+    db.prepare('INSERT INTO coin_transfers (from_license_id, to_license_id, amount) VALUES (?, ?, ?)').run(
+      req.license.id,
+      target.license_id,
+      amount
+    );
+  });
+  tx();
+
+  const newStats = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
+  res.json({ ok: true, coins: newStats.coins });
+});
+
 module.exports = router;
