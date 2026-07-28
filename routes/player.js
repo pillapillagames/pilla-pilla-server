@@ -8,7 +8,26 @@ const router = express.Router();
 // de scripts/player_data.gd en el cliente. El servidor es quien manda sobre
 // el precio real (el cliente solo lo usa para pintar el botón), así que si
 // cambias un precio aquí, cámbialo también allí para que no se desincronicen.
-const SKIN_PRICES = [0, 50, 50, 100, 150, 150];
+//
+// FIX (auditoría): este array solo tenía 6 precios, pero el cliente ya tiene
+// 15 skins en PlayerData.SKINS (índices 0-14: Fantasma, Lava, Verde,
+// Amarillo, Fantasma premium, Negro, Rojo, Fucsia, Aventura, Chico Rojo,
+// Chica, Chico Verde, Pilla Kid, Pilla Kid T-Pose, Sunny). Con el array
+// corto, /buy-skin rechazaba con "Skin inválida" cualquier índice >= 6 —
+// es decir, NINGUNA de las 9 skins más nuevas (incluidas todas las de
+// malla propia: Aventura, Chico Rojo, Chica, Chico Verde, Pilla Kid, Pilla
+// Kid T-Pose, Sunny) se podía comprar nunca, por mucho que el cliente
+// dejara intentarlo.
+//
+// OJO: los precios 6-14 de abajo son un relleno provisional (continúan la
+// escala 50/50/100/150/150 ya existente) SOLO para que dejen de estar
+// bloqueadas — no reflejan ninguna decisión de precio real. Antes de
+// publicar, decide los precios de verdad y ponlos aquí Y en
+// scripts/player_data.gd (que ahora mismo tiene casi todas a 1 de precio,
+// claramente también un valor de prueba sin terminar de ajustar). Y revisa
+// si "Pilla Kid T-Pose" (índice 13) debería venderse siquiera: por el
+// nombre pinta a asset de depuración/prueba, no a skin final.
+const SKIN_PRICES = [0, 50, 50, 100, 150, 150, 150, 150, 250, 250, 250, 250, 250, 250, 250];
 
 // Rangos calculados a partir del "elo" (que hace de contador de trofeos).
 // La columna "rank" de la base de datos ya no se usa: el rango siempre se
@@ -377,9 +396,22 @@ router.post('/match-result', requireToken, (req, res) => {
 // POST /api/player/sync  (requiere token)
 // Sincronización ÚNICA: sobrescribe las stats del servidor con el progreso
 // que el jugador ya tenía guardado localmente antes de que existiera esta
-// sincronización (nivel, monedas, xp, partidas...). El propio juego se
-// encarga de no llamar a esto más de una vez por dispositivo.
+// sincronización (nivel, monedas, xp, partidas...).
+//
+// GUARD SERVER-SIDE (auditoría): antes esto dependía solo de que el cliente
+// prometiera no llamarlo dos veces, lo que un jugador con el token JWT podía
+// saltarse llamando al endpoint directamente (curl/Postman) tantas veces
+// como quisiera para inflar sus stats sin límite. Ahora la columna
+// player_stats.synced_at guarda cuándo se hizo la única sincronización
+// válida; cualquier intento posterior se rechaza aquí, sin importar qué
+// mande el cliente ni desde qué dispositivo.
 router.post('/sync', requireToken, (req, res) => {
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const existing = db.prepare('SELECT synced_at FROM player_stats WHERE license_id = ?').get(req.license.id);
+  if (existing && existing.synced_at) {
+    return res.status(409).json({ ok: false, error: 'Esta licencia ya se sincronizó anteriormente.' });
+  }
+
   const {
     coins = 0,
     level = 1,
@@ -398,7 +430,6 @@ router.post('/sync', requireToken, (req, res) => {
     }
   }
 
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
   db.prepare(
     `UPDATE player_stats SET
        coins = ?,
@@ -409,6 +440,7 @@ router.post('/sync', requireToken, (req, res) => {
        total_catches = ?,
        best_survival_seconds = ?,
        elo = ?,
+       synced_at = datetime('now'),
        updated_at = datetime('now')
      WHERE license_id = ?`
   ).run(coins, level, xp, xpToNextLevel, matchesPlayed, totalCatches, bestSurvivalSeconds, elo, req.license.id);
