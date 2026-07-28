@@ -197,4 +197,16 @@ if (!playerStatsColumns.includes('tournament_matches')) {
   console.log('Migración aplicada: columna tournament_matches añadida a player_stats');
 }
 
+// Migración: marca de "ya se hizo la sincronización única" de /api/player/sync.
+// ANTES esto se confiaba por completo al cliente ("el juego no lo vuelve a
+// llamar"), lo que permitía a cualquiera con el token JWT (visible en el
+// propio cliente) llamar a /sync las veces que quisiera y meterse hasta
+// 10.000.000 de monedas/nivel/elo de golpe. Con esta columna el servidor
+// rechaza cualquier sync posterior a la primera vez, sea cual sea el
+// dispositivo o cuántas veces lo reintente el cliente.
+if (!playerStatsColumns.includes('synced_at')) {
+  db.exec("ALTER TABLE player_stats ADD COLUMN synced_at TEXT");
+  console.log('Migración aplicada: columna synced_at añadida a player_stats');
+}
+
 module.exports = db;
