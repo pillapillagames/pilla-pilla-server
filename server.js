@@ -12,6 +12,8 @@ const playerRoutes = require('./routes/player');
 const shopRoutes = require('./routes/shop');
 const adminRoutes = require('./routes/admin');
 const guildRoutes = require('./routes/guild');
+const friendsRoutes = require('./routes/friends');
+const battleRoutes = require('./routes/battle');
 const app = express();
 app.use(express.json());
 // --- Rutas públicas de login (fuera de /api, las visita el navegador) ---
@@ -32,6 +34,8 @@ app.use('/api/player', playerRoutes);
 app.use('/api/shop', shopRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/guild', guildRoutes);
+app.use('/api/friends', friendsRoutes);
+app.use('/api/battle', battleRoutes);
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'pilla-pilla-server' });
 });
