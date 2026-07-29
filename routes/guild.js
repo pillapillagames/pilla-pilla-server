@@ -58,6 +58,8 @@ function guildPayload(guild) {
     xp: guild.xp,
     xpToNextLevel: xpToNextLevel(guild.level),
     bankCoins: guild.bank_coins,
+    chestProgress: guild.chest_progress,
+    chestThreshold: guild.chest_threshold,
     createdAt: guild.created_at,
   };
 }
@@ -275,7 +277,8 @@ router.post('/donate', requireToken, (req, res) => {
     amount,
     req.license.id
   );
-  db.prepare('UPDATE guilds SET bank_coins = bank_coins + ?, level = ?, xp = ? WHERE id = ?').run(
+  db.prepare('UPDATE guilds SET bank_coins = bank_coins + ?, chest_progress = chest_progress + ?, level = ?, xp = ? WHERE id = ?').run(
+    amount,
     amount,
     level,
     xp,
@@ -361,6 +364,69 @@ router.post('/chat', requireToken, (req, res) => {
       system: false,
     },
   });
+});
+
+const CHEST_REWARD_PER_MEMBER = 50; // monedas que recibe cada miembro al abrir el cofre
+
+// POST /api/guild/chest/open  (requiere token, requiere estar en un clan)
+// Cualquier miembro puede abrirlo en cuanto chest_progress alcanza
+// chest_threshold: reparte CHEST_REWARD_PER_MEMBER monedas a cada miembro
+// actual, descuenta el umbral del progreso (el sobrante se queda para el
+// siguiente cofre) y deja constancia en el chat como mensaje de sistema.
+router.post('/chest/open', requireToken, (req, res) => {
+  const membership = getMembership(req.license.id);
+  if (!membership) {
+    return res.status(400).json({ ok: false, error: 'No perteneces a ningún clan.' });
+  }
+  const guild = getGuildById(membership.guild_id);
+  if (!guild) {
+    return res.status(404).json({ ok: false, error: 'Tu clan ya no existe.' });
+  }
+  if (guild.chest_progress < guild.chest_threshold) {
+    return res.status(400).json({ ok: false, error: 'El cofre todavía no está listo.' });
+  }
+
+  const members = db.prepare('SELECT license_id FROM guild_members WHERE guild_id = ?').all(guild.id);
+
+  const openChest = db.transaction(() => {
+    for (const m of members) {
+      db.prepare('UPDATE player_stats SET coins = coins + ? WHERE license_id = ?').run(
+        CHEST_REWARD_PER_MEMBER,
+        m.license_id
+      );
+    }
+    db.prepare('UPDATE guilds SET chest_progress = chest_progress - chest_threshold WHERE id = ?').run(guild.id);
+
+    const username = getUsername(req.license.id);
+    db.prepare(
+      `INSERT INTO guild_messages (guild_id, license_id, username, message) VALUES (?, NULL, 'Sistema', ?)`
+    ).run(
+      guild.id,
+      `🎁 ${username} ha abierto el cofre del clan: ${CHEST_REWARD_PER_MEMBER} monedas para cada uno de los ${members.length} miembros.`
+    );
+  });
+  openChest();
+
+  const updatedGuild = getGuildById(guild.id);
+  res.json({ ok: true, guild: guildPayload(updatedGuild), reward: CHEST_REWARD_PER_MEMBER });
+});
+
+// GET /api/guild/history  (requiere token)
+// Reutiliza guild_messages: los mensajes de sistema (license_id NULL) ya son
+// el historial del clan (altas, expulsiones, cambios de líder, subidas de
+// nivel, cofres abiertos...), así que no hace falta tabla nueva.
+router.get('/history', requireToken, (req, res) => {
+  const membership = getMembership(req.license.id);
+  if (!membership) {
+    return res.json({ ok: true, entries: [] });
+  }
+  const rows = db
+    .prepare(
+      'SELECT id, message, created_at AS createdAt FROM guild_messages WHERE guild_id = ? AND license_id IS NULL ORDER BY id DESC LIMIT 50'
+    )
+    .all(membership.guild_id);
+
+  res.json({ ok: true, entries: rows });
 });
 
 module.exports = router;
