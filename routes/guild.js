@@ -249,13 +249,24 @@ router.post('/donate', requireToken, (req, res) => {
     return res.status(400).json({ ok: false, error: `La donación debe ser un número entero entre 1 y ${MAX_DONATION}.` });
   }
 
+  // "coins" (por defecto) = monedas normales, se descuentan aquí en el
+  // servidor (SON las que manda). "training" = monedas de entrenamiento,
+  // que solo existen en el cliente (ver PlayerData.training_coins) y ya
+  // fueron validadas/descontadas allí antes de llamar a este endpoint; el
+  // servidor NO debe tocar player_stats.coins para esta donación, solo
+  // acreditar el banco/xp del clan.
+  const source = req.body?.source === 'training' ? 'training' : 'coins';
+
   const membership = getMembership(req.license.id);
   if (!membership) {
     return res.status(400).json({ ok: false, error: 'No perteneces a ningún clan.' });
   }
 
   const stats = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
-  if (!stats || stats.coins < amount) {
+  if (!stats) {
+    return res.status(400).json({ ok: false, error: 'No se encontró tu perfil.' });
+  }
+  if (source === 'coins' && stats.coins < amount) {
     return res.status(400).json({ ok: false, error: 'No tienes monedas suficientes.' });
   }
 
@@ -273,10 +284,12 @@ router.post('/donate', requireToken, (req, res) => {
     level += 1;
   }
 
-  db.prepare('UPDATE player_stats SET coins = coins - ?, updated_at = datetime(\'now\') WHERE license_id = ?').run(
-    amount,
-    req.license.id
-  );
+  if (source === 'coins') {
+    db.prepare('UPDATE player_stats SET coins = coins - ?, updated_at = datetime(\'now\') WHERE license_id = ?').run(
+      amount,
+      req.license.id
+    );
+  }
   db.prepare('UPDATE guilds SET bank_coins = bank_coins + ?, chest_progress = chest_progress + ?, level = ?, xp = ? WHERE id = ?').run(
     amount,
     amount,
@@ -291,13 +304,14 @@ router.post('/donate', requireToken, (req, res) => {
 
   if (level > guild.level) {
     const username = getUsername(req.license.id);
+    const label = source === 'training' ? 'monedas de entrenamiento' : 'monedas';
     db.prepare(
       `INSERT INTO guild_messages (guild_id, license_id, username, message) VALUES (?, NULL, 'Sistema', ?)`
-    ).run(guild.id, `${username} ha donado ${amount} monedas. ¡El clan ha subido a nivel ${level}!`);
+    ).run(guild.id, `${username} ha donado ${amount} ${label}. ¡El clan ha subido a nivel ${level}!`);
   }
 
   guild = getGuildById(guild.id);
-  const newCoins = stats.coins - amount;
+  const newCoins = source === 'coins' ? stats.coins - amount : stats.coins;
   res.json({ ok: true, guild: guildPayload(guild), coins: newCoins });
 });
 
