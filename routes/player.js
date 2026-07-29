@@ -9,25 +9,16 @@ const router = express.Router();
 // el precio real (el cliente solo lo usa para pintar el botón), así que si
 // cambias un precio aquí, cámbialo también allí para que no se desincronicen.
 //
-// FIX (auditoría): este array solo tenía 6 precios, pero el cliente ya tiene
-// 15 skins en PlayerData.SKINS (índices 0-14: Fantasma, Lava, Verde,
-// Amarillo, Fantasma premium, Negro, Rojo, Fucsia, Aventura, Chico Rojo,
-// Chica, Chico Verde, Pilla Kid, Pilla Kid T-Pose, Sunny). Con el array
-// corto, /buy-skin rechazaba con "Skin inválida" cualquier índice >= 6 —
-// es decir, NINGUNA de las 9 skins más nuevas (incluidas todas las de
-// malla propia: Aventura, Chico Rojo, Chica, Chico Verde, Pilla Kid, Pilla
-// Kid T-Pose, Sunny) se podía comprar nunca, por mucho que el cliente
-// dejara intentarlo.
-//
-// OJO: los precios 6-14 de abajo son un relleno provisional (continúan la
-// escala 50/50/100/150/150 ya existente) SOLO para que dejen de estar
-// bloqueadas — no reflejan ninguna decisión de precio real. Antes de
-// publicar, decide los precios de verdad y ponlos aquí Y en
-// scripts/player_data.gd (que ahora mismo tiene casi todas a 1 de precio,
-// claramente también un valor de prueba sin terminar de ajustar). Y revisa
-// si "Pilla Kid T-Pose" (índice 13) debería venderse siquiera: por el
-// nombre pinta a asset de depuración/prueba, no a skin final.
-const SKIN_PRICES = [0, 50, 50, 100, 150, 150, 150, 150, 250, 250, 250, 250, 250, 250, 250];
+// FIX: estos precios estaban desincronizados de PlayerData.SKINS en el
+// cliente (placeholder en escala 50/50/100/150.../250 y con 15 entradas en
+// vez de 14). El cliente pinta el botón "Comprar (1 moneda)" para casi
+// todas las skins, pero este endpoint seguía cobrando 50-250 monedas reales
+// y rechazaba la compra como "no tienes monedas suficientes" aunque el
+// jugador tuviera de sobra para el precio mostrado. Ajustado 1:1 con el
+// array SKINS del cliente (14 índices, casi todos a 1 salvo Fantasma base
+// que es gratis). Si cambias un precio en player_data.gd, cámbialo aquí
+// también.
+const SKIN_PRICES = [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
 
 // Rangos calculados a partir del "elo" (que hace de contador de trofeos).
 // La columna "rank" de la base de datos ya no se usa: el rango siempre se
