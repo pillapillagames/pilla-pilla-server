@@ -264,6 +264,19 @@ if (!guildsColumns.includes('xp')) {
   console.log('Migración aplicada: columna xp añadida a guilds');
 }
 
+// Migración: progreso del cofre del clan. Sube con cada donación (a la vez
+// que el banco y la xp, ver POST /api/guild/donate) y se resetea (restando
+// el umbral, no a 0, para no perder el sobrante si se dona de golpe una
+// cantidad grande) al abrir el cofre (ver POST /api/guild/chest/open).
+if (!guildsColumns.includes('chest_progress')) {
+  db.exec("ALTER TABLE guilds ADD COLUMN chest_progress INTEGER NOT NULL DEFAULT 0");
+  console.log('Migración aplicada: columna chest_progress añadida a guilds');
+}
+if (!guildsColumns.includes('chest_threshold')) {
+  db.exec("ALTER TABLE guilds ADD COLUMN chest_threshold INTEGER NOT NULL DEFAULT 500");
+  console.log('Migración aplicada: columna chest_threshold añadida a guilds');
+}
+
 // Migración: cuánto ha donado cada miembro en total (para poder mostrar un
 // ranking de donantes dentro del clan más adelante si hace falta).
 const guildMembersColumns = db.prepare("PRAGMA table_info(guild_members)").all().map((c) => c.name);
