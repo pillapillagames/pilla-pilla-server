@@ -244,7 +244,38 @@ router.post('/nickname', requireToken, (req, res) => {
 //   won: boolean               // si ganó la partida
 // }
 // El servidor SUMA estos valores a los totales guardados, no los reemplaza.
+// AUDITORÍA: a diferencia de /sync (guard de una sola vez con synced_at) o
+// /buy-skin y /send-coins (que restan de un saldo real y no pueden "crear"
+// monedas de la nada), este endpoint se limitaba a aceptar cualquier valor
+// razonable y sumarlo, sin nada que impidiera llamarlo en bucle. Con el JWT
+// válido, cualquiera podía golpear /match-result con curl/Postman tantas
+// veces por segundo como quisiera y con los topes viejos (hasta 100.000 por
+// campo) para inflarse monedas, XP y elo sin jugar ni una partida real.
+//
+// Dos capas de defensa, igual que se hizo en otros endpoints de la auditoría:
+//  1) Topes por campo ajustados a lo que una partida real puede dar como
+//     máximo (ver game_manager.gd: MATCH_DURATION=180s,
+//     xp_gained = 40 + tags*10 + survival*0.3 + placement_bonus, más el
+//     bonus de estrella amarilla +5 monedas/+15 xp por recogida). Se deja
+//     margen generoso para no romper partidas legítimas con muchas estrellas
+//     o rachas de pilladas, pero ya no se puede colar un valor de otro orden
+//     de magnitud.
+//  2) Cooldown mínimo entre envíos por licencia: una partida real dura
+//     varios segundos como mínimo, así que un cooldown de 10s por debajo de
+//     eso no afecta a nadie jugando de verdad pero corta en seco el bucle de
+//     farmeo por API directa. Se guarda en memoria (no en la BD) porque solo
+//     necesita sobrevivir mientras el proceso está vivo — un reinicio del
+//     servidor resetea el cooldown, lo cual es aceptable para esta defensa.
+const MATCH_RESULT_COOLDOWN_MS = 10 * 1000;
+const _lastMatchResultAt = new Map();
+
 router.post('/match-result', requireToken, (req, res) => {
+  const now = Date.now();
+  const lastAt = _lastMatchResultAt.get(req.license.id) || 0;
+  if (now - lastAt < MATCH_RESULT_COOLDOWN_MS) {
+    return res.status(429).json({ ok: false, error: 'Estás mandando resultados de partida demasiado rápido.' });
+  }
+
   const {
     coinsEarned = 0,
     xpEarned = 0,
@@ -255,11 +286,19 @@ router.post('/match-result', requireToken, (req, res) => {
     tournamentPlacement = -1, // 0 = 1º puesto, 1 = 2º... -1 = no jugó Modo Torneo
   } = req.body || {};
 
-  // Validación básica: todo debe ser un número no negativo y razonable,
-  // para evitar que un cliente manipulado mande valores absurdos.
+  // Topes por campo, acotados al máximo plausible de UNA partida real (ver
+  // comentario de arriba), no al máximo plausible acumulado de toda una
+  // cuenta (eso ya lo cubre /sync con sus propios límites).
+  const MATCH_LIMITS = {
+    coinsEarned: { min: 0, max: 300 }, // 40 base + margen amplio de estrellas (+5 c/u)
+    xpEarned: { min: 0, max: 600 }, // 40 + tags*10 + survival*0.3 + placement(30) + estrellas
+    survivalSeconds: { min: 0, max: 200 }, // MATCH_DURATION=180s + margen
+    caught: { min: 0, max: 50 }, // pilladas en una sola partida de 3 min
+  };
   const nums = { coinsEarned, xpEarned, survivalSeconds, caught };
   for (const [key, value] of Object.entries(nums)) {
-    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 100000) {
+    const { min, max } = MATCH_LIMITS[key];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) {
       return res.status(400).json({ ok: false, error: `Valor inválido: ${key}` });
     }
   }
@@ -359,6 +398,11 @@ router.post('/match-result', requireToken, (req, res) => {
     newTournamentMatches,
     req.license.id
   );
+
+  // Solo se marca el cooldown si la petición llegó hasta aquí (pasó
+  // validación y se guardó); una petición rechazada antes no debe "gastar"
+  // el cooldown del jugador legítimo que reintenta tras un error.
+  _lastMatchResultAt.set(req.license.id, now);
 
   res.json({
     ok: true,
