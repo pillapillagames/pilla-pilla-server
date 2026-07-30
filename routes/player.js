@@ -414,11 +414,48 @@ router.post('/sync', requireToken, (req, res) => {
     elo = 0,
   } = req.body || {};
 
+  // LÍMITES DE PLAUSIBILIDAD (auditoría, hallazgo pendiente #1): antes todos
+  // los campos compartían un único tope genérico (0-10.000.000), que en la
+  // práctica no filtraba casi nada: un cliente modificado podía mandar, p.ej.,
+  // 9.999.999 monedas y quedaba aceptado. Ahora cada campo tiene su propio
+  // rango plausible, alineado con las constantes MAX_PLAUSIBLE_* que ya usa
+  // el cliente en server_sync.gd::_sync_local_progress_once — así el
+  // servidor deja de confiar ciegamente en lo que declare un cliente que se
+  // salte ese clamp llamando directamente al endpoint (curl/Postman/etc).
+  // Sigue sin ser una fuente de verdad "de verdad" (ver limitación conocida
+  // en la auditoría), pero cierra el caso de valores absurdos de un solo
+  // golpe en la única sincronización permitida.
+  const LIMITS = {
+    coins: { min: 0, max: 50000 },
+    level: { min: 1, max: 200 },
+    xp: { min: 0, max: 11940 }, // xp_needed_for_level(200) = 100 + 199*60
+    xpToNextLevel: { min: 100, max: 11940 },
+    matchesPlayed: { min: 0, max: 5000 },
+    totalCatches: { min: 0, max: 20000 },
+    bestSurvivalSeconds: { min: 0, max: 3600 },
+    elo: { min: 0, max: 3000 },
+  };
+
   const nums = { coins, level, xp, xpToNextLevel, matchesPlayed, totalCatches, bestSurvivalSeconds, elo };
   for (const [key, value] of Object.entries(nums)) {
-    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 10000000) {
+    const { min, max } = LIMITS[key];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) {
       return res.status(400).json({ ok: false, error: `Valor inválido: ${key}` });
     }
+  }
+
+  // Coherencia cruzada: xpToNextLevel debe corresponder a la fórmula real
+  // del nivel declarado (100 + (level-1)*60), y xp no puede superarlo (si lo
+  // supera, ya tendría que haber subido de nivel). Esto atrapa un caso que
+  // los rangos por campo, por sí solos, dejarían pasar: level=1 con
+  // xpToNextLevel=11940 (falso, pero dentro de rango) para disfrazar otro
+  // valor, o xp mayor que su propio xpToNextLevel.
+  const expectedXpToNextLevel = 100 + (level - 1) * 60;
+  if (xpToNextLevel !== expectedXpToNextLevel) {
+    return res.status(400).json({ ok: false, error: 'Valor inválido: xpToNextLevel no corresponde al nivel declarado' });
+  }
+  if (xp > xpToNextLevel) {
+    return res.status(400).json({ ok: false, error: 'Valor inválido: xp supera xpToNextLevel' });
   }
 
   db.prepare(
