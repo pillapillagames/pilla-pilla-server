@@ -1,6 +1,6 @@
 {
   "name": "pilla-pilla-server",
-  "version": "3.5.0",
+  "version": "3.5.1",
   "private": true,
   "description": "Backend de licencias, tienda y sincronización de Pilla Pilla.",
   "main": "server.js",
