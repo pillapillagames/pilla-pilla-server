@@ -15,6 +15,18 @@ const guildRoutes = require('./routes/guild');
 const friendsRoutes = require('./routes/friends');
 const battleRoutes = require('./routes/battle');
 const app = express();
+
+// --- CORS: permite que páginas web (tienda, launcher web, etc.) llamen
+// a esta API desde el navegador. Sin esto, el navegador bloquea la
+// petición en el "preflight" OPTIONS antes de que llegue a tus rutas. ---
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-admin-key, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json());
 // --- Rutas públicas de login (fuera de /api, las visita el navegador) ---
 app.use('/auth', authRoutes);
