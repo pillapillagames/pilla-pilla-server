@@ -285,6 +285,16 @@ if (!guildMembersColumns.includes('total_donated')) {
   console.log('Migración aplicada: columna total_donated añadida a guild_members');
 }
 
+// Migración: rol dentro del clan ('member' u 'officer'). El líder no se
+// guarda aquí (sigue siendo guilds.leader_license_id, ya existía); esto solo
+// añade un escalón intermedio ("Oficial") para poder ascender/descender
+// miembros sin tener que tocar el liderazgo. Todos los miembros ya
+// existentes arrancan como 'member'.
+if (!guildMembersColumns.includes('role')) {
+  db.exec("ALTER TABLE guild_members ADD COLUMN role TEXT NOT NULL DEFAULT 'member'");
+  console.log('Migración aplicada: columna role añadida a guild_members');
+}
+
 // Migración: marca de "ya se hizo la sincronización única" de /api/player/sync.
 // ANTES esto se confiaba por completo al cliente ("el juego no lo vuelve a
 // llamar"), lo que permitía a cualquiera con el token JWT (visible en el
@@ -296,5 +306,53 @@ if (!playerStatsColumns.includes('synced_at')) {
   db.exec("ALTER TABLE player_stats ADD COLUMN synced_at TEXT");
   console.log('Migración aplicada: columna synced_at añadida a player_stats');
 }
+
+// --- Fase 5a: Casas de Jugadores, Zona de Mascotas y Tienda de Gestos ---
+// Las tres funcionalidades identifican al jugador por license_id, igual que
+// el resto de tablas de este archivo (no hay una tabla "players" separada:
+// la licencia ES el jugador). Se crean aquí, junto al resto del esquema, en
+// vez de en un fichero de migración aparte, porque este proyecto no usa
+// migrate.js: todo el esquema vive en este db.exec() que se ejecuta al
+// arrancar el servidor.
+db.exec(`
+CREATE TABLE IF NOT EXISTS player_houses (
+  license_id INTEGER PRIMARY KEY REFERENCES licenses(id),
+  layout_json TEXT NOT NULL DEFAULT '[]',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS player_house_furniture (
+  license_id INTEGER NOT NULL REFERENCES licenses(id),
+  item_id TEXT NOT NULL,
+  purchased_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (license_id, item_id)
+);
+
+CREATE TABLE IF NOT EXISTS player_pets (
+  pet_id TEXT PRIMARY KEY,
+  license_id INTEGER NOT NULL REFERENCES licenses(id),
+  species_id TEXT NOT NULL,
+  level INTEGER NOT NULL DEFAULT 1,
+  nickname TEXT NOT NULL DEFAULT '',
+  equipped INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_player_pets_license ON player_pets (license_id);
+
+CREATE TABLE IF NOT EXISTS player_gestures (
+  license_id INTEGER NOT NULL REFERENCES licenses(id),
+  gesture_id TEXT NOT NULL,
+  purchased_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (license_id, gesture_id)
+);
+
+CREATE TABLE IF NOT EXISTS player_gesture_slots (
+  license_id INTEGER NOT NULL REFERENCES licenses(id),
+  slot INTEGER NOT NULL,
+  gesture_id TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (license_id, slot)
+);
+`);
 
 module.exports = db;
