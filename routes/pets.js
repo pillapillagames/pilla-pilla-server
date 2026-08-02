@@ -53,6 +53,16 @@ router.post('/adopt', requireToken, (req, res) => {
   const species = getSpecies(speciesId);
   if (!species) return res.status(400).json({ ok: false, error: 'Especie desconocida' });
 
+  // Un jugador solo puede tener una mascota de cada especie. Sin este check,
+  // /adopt no ponía ningún límite y se podían acumular varias "brisa", por
+  // ejemplo, gastando monedas en algo que no aporta nada nuevo.
+  const alreadyOwned = db
+    .prepare('SELECT 1 FROM player_pets WHERE license_id = ? AND species_id = ?')
+    .get(req.license.id, speciesId);
+  if (alreadyOwned) {
+    return res.status(400).json({ ok: false, error: 'Ya tienes una mascota de esa especie' });
+  }
+
   db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
   const stats = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
   const currentCoins = stats ? stats.coins : 0;
