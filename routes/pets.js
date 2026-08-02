@@ -8,6 +8,7 @@
 //   POST /api/player/pets/adopt  -> body { speciesId: "brisa", nickname?: "..." }
 //   POST /api/player/pets/train  -> body { petId: "..." }
 //   POST /api/player/pets/equip  -> body { petId: "..." }
+//   POST /api/player/pets/release -> body { petId: "..." }
 
 const express = require('express');
 const crypto = require('crypto');
@@ -151,6 +152,26 @@ router.post('/equip', requireToken, (req, res) => {
 
   db.prepare('UPDATE player_pets SET equipped = 0 WHERE license_id = ?').run(req.license.id);
   db.prepare('UPDATE player_pets SET equipped = 1 WHERE pet_id = ?').run(petId);
+
+  res.json({ ok: true });
+});
+
+// POST /api/player/pets/release  body: { petId }
+// Libera (borra) una mascota. No hay reembolso de monedas: si luego el
+// jugador quiere esa especie otra vez, tiene que comprarla de nuevo en
+// /adopt. Sirve también para que los jugadores que ya tenían varias
+// mascotas de la misma especie (de antes de exigir 1-por-especie) puedan
+// quedarse solo con una liberando el resto.
+router.post('/release', requireToken, (req, res) => {
+  const petId = req.body?.petId;
+  if (!petId) return res.status(400).json({ ok: false, error: 'pet_id inválido' });
+
+  const petRow = db
+    .prepare('SELECT pet_id FROM player_pets WHERE pet_id = ? AND license_id = ?')
+    .get(petId, req.license.id);
+  if (!petRow) return res.status(404).json({ ok: false, error: 'Mascota no encontrada' });
+
+  db.prepare('DELETE FROM player_pets WHERE pet_id = ?').run(petId);
 
   res.json({ ok: true });
 });
