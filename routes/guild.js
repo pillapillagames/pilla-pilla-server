@@ -33,6 +33,17 @@ function getUsername(licenseId) {
   return (row && row.username) || `Jugador${licenseId}`;
 }
 
+// Registra un evento de sistema en el historial del clan (se guarda como
+// mensaje de chat con license_id NULL, ver GET /api/guild/history: reutiliza
+// guild_messages en vez de crear una tabla aparte). Usado por todas las
+// acciones que el Historial del Clan debe recordar: entradas, salidas,
+// donaciones, ascensos, descensos, cambios de líder y expulsiones.
+function logGuildEvent(guildId, message) {
+  db.prepare(
+    `INSERT INTO guild_messages (guild_id, license_id, username, message) VALUES (?, NULL, 'Sistema', ?)`
+  ).run(guildId, message);
+}
+
 function getMembership(licenseId) {
   return db.prepare('SELECT * FROM guild_members WHERE license_id = ?').get(licenseId);
 }
@@ -67,7 +78,7 @@ function guildPayload(guild) {
 function membersPayload(guildId) {
   const rows = db
     .prepare(
-      `SELECT gm.license_id AS licenseId, gm.joined_at AS joinedAt,
+      `SELECT gm.license_id AS licenseId, gm.joined_at AS joinedAt, gm.role AS role,
               COALESCE(ps.username, 'Jugador' || gm.license_id) AS username,
               COALESCE(ps.level, 1) AS level
        FROM guild_members gm
@@ -164,9 +175,7 @@ router.post('/join', requireToken, (req, res) => {
   db.prepare('INSERT INTO guild_members (license_id, guild_id) VALUES (?, ?)').run(req.license.id, guildId);
 
   const username = getUsername(req.license.id);
-  db.prepare(
-    `INSERT INTO guild_messages (guild_id, license_id, username, message) VALUES (?, NULL, 'Sistema', ?)`
-  ).run(guildId, `${username} se ha unido al clan.`);
+  logGuildEvent(guildId, `➕ ${username} se ha unido al clan.`);
 
   res.json({ ok: true, guild: guildPayload(guild), members: membersPayload(guildId) });
 });
@@ -182,6 +191,7 @@ router.post('/leave', requireToken, (req, res) => {
   }
   const guildId = membership.guild_id;
   const guild = getGuildById(guildId);
+  const leavingUsername = getUsername(req.license.id);
 
   db.prepare('DELETE FROM guild_members WHERE license_id = ?').run(req.license.id);
 
@@ -196,12 +206,13 @@ router.post('/leave', requireToken, (req, res) => {
     return res.json({ ok: true, disbanded: true });
   }
 
+  // Registro en el historial: toda salida deja constancia, sea o no el líder.
+  logGuildEvent(guildId, `➖ ${leavingUsername} ha salido del clan.`);
+
   if (guild && guild.leader_license_id === req.license.id) {
     db.prepare('UPDATE guilds SET leader_license_id = ? WHERE id = ?').run(remaining.license_id, guildId);
     const username = getUsername(remaining.license_id);
-    db.prepare(
-      `INSERT INTO guild_messages (guild_id, license_id, username, message) VALUES (?, NULL, 'Sistema', ?)`
-    ).run(guildId, `${username} es ahora el líder del clan.`);
+    logGuildEvent(guildId, `👑 ${username} es ahora el líder del clan (liderazgo heredado automáticamente).`);
   }
 
   res.json({ ok: true, disbanded: false });
@@ -230,9 +241,7 @@ router.post('/kick', requireToken, (req, res) => {
 
   db.prepare('DELETE FROM guild_members WHERE license_id = ?').run(licenseId);
   const username = getUsername(licenseId);
-  db.prepare(
-    `INSERT INTO guild_messages (guild_id, license_id, username, message) VALUES (?, NULL, 'Sistema', ?)`
-  ).run(guild.id, `${username} ha sido expulsado del clan.`);
+  logGuildEvent(guild.id, `🚫 ${username} ha sido expulsado del clan por ${getUsername(req.license.id)}.`);
 
   res.json({ ok: true, guild: guildPayload(guild), members: membersPayload(guild.id) });
 });
@@ -305,9 +314,11 @@ router.post('/donate', requireToken, (req, res) => {
   if (level > guild.level) {
     const username = getUsername(req.license.id);
     const label = source === 'training' ? 'monedas de entrenamiento' : 'monedas';
-    db.prepare(
-      `INSERT INTO guild_messages (guild_id, license_id, username, message) VALUES (?, NULL, 'Sistema', ?)`
-    ).run(guild.id, `${username} ha donado ${amount} ${label}. ¡El clan ha subido a nivel ${level}!`);
+    logGuildEvent(guild.id, `💰 ${username} ha donado ${amount} ${label}. ¡El clan ha subido a nivel ${level}!`);
+  } else {
+    const username = getUsername(req.license.id);
+    const label = source === 'training' ? 'monedas de entrenamiento' : 'monedas';
+    logGuildEvent(guild.id, `💰 ${username} ha donado ${amount} ${label} al clan.`);
   }
 
   guild = getGuildById(guild.id);
@@ -412,9 +423,7 @@ router.post('/chest/open', requireToken, (req, res) => {
     db.prepare('UPDATE guilds SET chest_progress = chest_progress - chest_threshold WHERE id = ?').run(guild.id);
 
     const username = getUsername(req.license.id);
-    db.prepare(
-      `INSERT INTO guild_messages (guild_id, license_id, username, message) VALUES (?, NULL, 'Sistema', ?)`
-    ).run(
+    logGuildEvent(
       guild.id,
       `🎁 ${username} ha abierto el cofre del clan: ${CHEST_REWARD_PER_MEMBER} monedas para cada uno de los ${members.length} miembros.`
     );
@@ -423,6 +432,110 @@ router.post('/chest/open', requireToken, (req, res) => {
 
   const updatedGuild = getGuildById(guild.id);
   res.json({ ok: true, guild: guildPayload(updatedGuild), reward: CHEST_REWARD_PER_MEMBER });
+});
+
+// POST /api/guild/promote  body: { licenseId }  (requiere token, solo el líder)
+// Asciende a un miembro normal a Oficial. Los Oficiales no tienen todavía
+// permisos extra propios en el servidor (de momento solo es un rango visible
+// en la lista de miembros); pensado como paso intermedio antes de ceder el
+// liderazgo del todo con /transfer-leader.
+router.post('/promote', requireToken, (req, res) => {
+  const { licenseId } = req.body || {};
+  const membership = getMembership(req.license.id);
+  if (!membership) {
+    return res.status(400).json({ ok: false, error: 'No perteneces a ningún clan.' });
+  }
+  const guild = getGuildById(membership.guild_id);
+  if (!guild || guild.leader_license_id !== req.license.id) {
+    return res.status(403).json({ ok: false, error: 'Solo el líder del clan puede ascender miembros.' });
+  }
+  if (!Number.isInteger(licenseId) || licenseId === req.license.id) {
+    return res.status(400).json({ ok: false, error: 'Miembro inválido.' });
+  }
+  const target = db
+    .prepare('SELECT * FROM guild_members WHERE license_id = ? AND guild_id = ?')
+    .get(licenseId, guild.id);
+  if (!target) {
+    return res.status(404).json({ ok: false, error: 'Ese jugador no está en tu clan.' });
+  }
+  if (target.role === 'officer') {
+    return res.status(400).json({ ok: false, error: 'Ese miembro ya es Oficial.' });
+  }
+
+  db.prepare("UPDATE guild_members SET role = 'officer' WHERE license_id = ?").run(licenseId);
+  const username = getUsername(licenseId);
+  logGuildEvent(guild.id, `⬆️ ${username} ha sido ascendido a Oficial por ${getUsername(req.license.id)}.`);
+
+  res.json({ ok: true, guild: guildPayload(guild), members: membersPayload(guild.id) });
+});
+
+// POST /api/guild/demote  body: { licenseId }  (requiere token, solo el líder)
+// Baja a un Oficial de vuelta a miembro normal.
+router.post('/demote', requireToken, (req, res) => {
+  const { licenseId } = req.body || {};
+  const membership = getMembership(req.license.id);
+  if (!membership) {
+    return res.status(400).json({ ok: false, error: 'No perteneces a ningún clan.' });
+  }
+  const guild = getGuildById(membership.guild_id);
+  if (!guild || guild.leader_license_id !== req.license.id) {
+    return res.status(403).json({ ok: false, error: 'Solo el líder del clan puede descender miembros.' });
+  }
+  if (!Number.isInteger(licenseId) || licenseId === req.license.id) {
+    return res.status(400).json({ ok: false, error: 'Miembro inválido.' });
+  }
+  const target = db
+    .prepare('SELECT * FROM guild_members WHERE license_id = ? AND guild_id = ?')
+    .get(licenseId, guild.id);
+  if (!target) {
+    return res.status(404).json({ ok: false, error: 'Ese jugador no está en tu clan.' });
+  }
+  if (target.role !== 'officer') {
+    return res.status(400).json({ ok: false, error: 'Ese miembro ya es un miembro normal.' });
+  }
+
+  db.prepare("UPDATE guild_members SET role = 'member' WHERE license_id = ?").run(licenseId);
+  const username = getUsername(licenseId);
+  logGuildEvent(guild.id, `⬇️ ${username} ha sido descendido a Miembro por ${getUsername(req.license.id)}.`);
+
+  res.json({ ok: true, guild: guildPayload(guild), members: membersPayload(guild.id) });
+});
+
+// POST /api/guild/transfer-leader  body: { licenseId }  (requiere token, solo el líder)
+// Cede el liderazgo del clan a otro miembro de inmediato (a diferencia del
+// traspaso automático de /leave, que solo ocurre cuando el líder abandona el
+// clan). El líder saliente pasa a Oficial en vez de quedar como miembro raso.
+router.post('/transfer-leader', requireToken, (req, res) => {
+  const { licenseId } = req.body || {};
+  const membership = getMembership(req.license.id);
+  if (!membership) {
+    return res.status(400).json({ ok: false, error: 'No perteneces a ningún clan.' });
+  }
+  const guild = getGuildById(membership.guild_id);
+  if (!guild || guild.leader_license_id !== req.license.id) {
+    return res.status(403).json({ ok: false, error: 'Solo el líder del clan puede ceder el liderazgo.' });
+  }
+  if (!Number.isInteger(licenseId) || licenseId === req.license.id) {
+    return res.status(400).json({ ok: false, error: 'Miembro inválido.' });
+  }
+  const target = db
+    .prepare('SELECT * FROM guild_members WHERE license_id = ? AND guild_id = ?')
+    .get(licenseId, guild.id);
+  if (!target) {
+    return res.status(404).json({ ok: false, error: 'Ese jugador no está en tu clan.' });
+  }
+
+  const oldLeaderId = req.license.id;
+  db.prepare('UPDATE guilds SET leader_license_id = ? WHERE id = ?').run(licenseId, guild.id);
+  db.prepare("UPDATE guild_members SET role = 'officer' WHERE license_id = ?").run(oldLeaderId);
+  db.prepare("UPDATE guild_members SET role = 'member' WHERE license_id = ?").run(licenseId);
+
+  const newLeaderName = getUsername(licenseId);
+  const oldLeaderName = getUsername(oldLeaderId);
+  logGuildEvent(guild.id, `👑 ${oldLeaderName} ha entregado el liderazgo del clan a ${newLeaderName}.`);
+
+  const updatedGuild = getGuildById(guild.id);
+  res.json({ ok: true, guild: guildPayload(updatedGuild), members: membersPayload(guild.id) });
 });
 
 // GET /api/guild/history  (requiere token)
