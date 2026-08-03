@@ -258,12 +258,19 @@ router.post('/donate', requireToken, (req, res) => {
     return res.status(400).json({ ok: false, error: `La donación debe ser un número entero entre 1 y ${MAX_DONATION}.` });
   }
 
-  // "coins" (por defecto) = monedas normales, se descuentan aquí en el
-  // servidor (SON las que manda). "training" = monedas de entrenamiento,
-  // que solo existen en el cliente (ver PlayerData.training_coins) y ya
-  // fueron validadas/descontadas allí antes de llamar a este endpoint; el
-  // servidor NO debe tocar player_stats.coins para esta donación, solo
-  // acreditar el banco/xp del clan.
+  // "coins" (por defecto) = monedas normales. "training" = monedas de
+  // entrenamiento. Ambas se validan y descuentan AQUÍ, en el servidor,
+  // contra su columna correspondiente en player_stats (coins / training_coins).
+  //
+  // FIX (auditoría de seguridad — exploit económico real): antes "training"
+  // asumía que esas monedas "solo existen en el cliente" y que ya habían
+  // sido descontadas allí, así que el servidor no validaba ni descontaba
+  // nada. Cualquiera podía spamear este endpoint con source:"training" para
+  // inflar chest_progress/nivel/xp del clan sin gastar nada real, y
+  // /api/guild/chest/open repartía monedas reales a todo el clan cada vez
+  // que se llenaba: dinero real fabricado de la nada. Ahora training_coins
+  // es una columna server-authoritative (ver player.js::/training-coins-earned)
+  // y se valida/descuenta exactamente igual que coins.
   const source = req.body?.source === 'training' ? 'training' : 'coins';
 
   const membership = getMembership(req.license.id);
@@ -271,12 +278,15 @@ router.post('/donate', requireToken, (req, res) => {
     return res.status(400).json({ ok: false, error: 'No perteneces a ningún clan.' });
   }
 
-  const stats = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
+  const stats = db.prepare('SELECT coins, training_coins FROM player_stats WHERE license_id = ?').get(req.license.id);
   if (!stats) {
     return res.status(400).json({ ok: false, error: 'No se encontró tu perfil.' });
   }
   if (source === 'coins' && stats.coins < amount) {
     return res.status(400).json({ ok: false, error: 'No tienes monedas suficientes.' });
+  }
+  if (source === 'training' && stats.training_coins < amount) {
+    return res.status(400).json({ ok: false, error: 'No tienes tantas monedas de entrenamiento.' });
   }
 
   let guild = getGuildById(membership.guild_id);
@@ -295,6 +305,11 @@ router.post('/donate', requireToken, (req, res) => {
 
   if (source === 'coins') {
     db.prepare('UPDATE player_stats SET coins = coins - ?, updated_at = datetime(\'now\') WHERE license_id = ?').run(
+      amount,
+      req.license.id
+    );
+  } else {
+    db.prepare('UPDATE player_stats SET training_coins = training_coins - ?, updated_at = datetime(\'now\') WHERE license_id = ?').run(
       amount,
       req.license.id
     );
@@ -323,7 +338,8 @@ router.post('/donate', requireToken, (req, res) => {
 
   guild = getGuildById(guild.id);
   const newCoins = source === 'coins' ? stats.coins - amount : stats.coins;
-  res.json({ ok: true, guild: guildPayload(guild), coins: newCoins });
+  const newTrainingCoins = source === 'training' ? stats.training_coins - amount : stats.training_coins;
+  res.json({ ok: true, guild: guildPayload(guild), coins: newCoins, trainingCoins: newTrainingCoins });
 });
 
 // GET /api/guild/chat?after=0  (requiere token)
