@@ -307,6 +307,21 @@ if (!playerStatsColumns.includes('synced_at')) {
   console.log('Migración aplicada: columna synced_at añadida a player_stats');
 }
 
+// Migración: monedas de entrenamiento server-authoritative.
+// ANTES "training_coins" solo existía en el cliente (PlayerData.training_coins,
+// nunca sincronizada), y /api/guild/donate con source:"training" confiaba
+// ciegamente en que el cliente ya las había descontado, sin validar ni
+// descontar nada server-side. Cualquiera podía spamear ese endpoint para
+// inflar chest_progress/nivel/xp del clan sin gastar nada real, y luego
+// /api/guild/chest/open repartía monedas reales a todo el clan. Con esta
+// columna el servidor lleva su propio saldo de monedas de entrenamiento
+// (ver POST /api/player/training-coins-earned) y /donate lo valida y
+// descuenta igual que hace con "coins".
+if (!playerStatsColumns.includes('training_coins')) {
+  db.exec("ALTER TABLE player_stats ADD COLUMN training_coins INTEGER NOT NULL DEFAULT 0");
+  console.log('Migración aplicada: columna training_coins añadida a player_stats');
+}
+
 // --- Fase 5a: Casas de Jugadores, Zona de Mascotas y Tienda de Gestos ---
 // Las tres funcionalidades identifican al jugador por license_id, igual que
 // el resto de tablas de este archivo (no hay una tabla "players" separada:
