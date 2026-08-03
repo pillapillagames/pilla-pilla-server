@@ -141,6 +141,19 @@ router.post('/train', requireToken, (req, res) => {
 
 // POST /api/player/pets/equip  body: { petId }
 // Solo una mascota equipada a la vez: desequipa el resto primero.
+//
+// Nota sobre condiciones de carrera: better-sqlite3 ejecuta todas las
+// consultas de forma SÍNCRONA sobre una única conexión, y Node.js es
+// single-threaded. Eso significa que entre dos sentencias .run()/.get()
+// seguidas dentro del mismo handler NO puede colarse ninguna otra petición
+// HTTP a medio camino: el bloque se ejecuta de un tirón. Aun así, para que
+// quede explícito y agrupado como una sola unidad atómica (y por si en el
+// futuro se migra a un driver asíncrono), se envuelve en una transacción.
+const equipPetTx = db.transaction((licenseId, petId) => {
+  db.prepare('UPDATE player_pets SET equipped = 0 WHERE license_id = ?').run(licenseId);
+  db.prepare('UPDATE player_pets SET equipped = 1 WHERE pet_id = ?').run(petId);
+});
+
 router.post('/equip', requireToken, (req, res) => {
   const petId = req.body?.petId;
   if (!petId) return res.status(400).json({ ok: false, error: 'pet_id inválido' });
@@ -150,8 +163,7 @@ router.post('/equip', requireToken, (req, res) => {
     .get(petId, req.license.id);
   if (!petRow) return res.status(404).json({ ok: false, error: 'Mascota no encontrada' });
 
-  db.prepare('UPDATE player_pets SET equipped = 0 WHERE license_id = ?').run(req.license.id);
-  db.prepare('UPDATE player_pets SET equipped = 1 WHERE pet_id = ?').run(petId);
+  equipPetTx(req.license.id, petId);
 
   res.json({ ok: true });
 });
@@ -162,6 +174,75 @@ router.post('/equip', requireToken, (req, res) => {
 // /adopt. Sirve también para que los jugadores que ya tenían varias
 // mascotas de la misma especie (de antes de exigir 1-por-especie) puedan
 // quedarse solo con una liberando el resto.
+//
+// Reasignación automática de mascota equipada:
+// Si la mascota liberada era la equipada, el jugador se quedaba sin ninguna
+// mascota activa hasta que entraba a la Zona de Mascotas y equipaba otra a
+// mano. Para evitar esa mala experiencia silenciosa, si la que se libera
+// estaba equipada buscamos automáticamente la siguiente mascota más antigua
+// (por created_at, con pet_id como desempate estable) que no sea la que se
+// va a borrar, y la marcamos como equipada. Si no queda ninguna otra
+// mascota, el jugador simplemente se queda sin mascota equipada (no es un
+// error).
+//
+// Toda la operación (comprobar equipped, borrar, reasignar) va dentro de
+// una única transacción de better-sqlite3. Como better-sqlite3 es síncrono
+// y Node.js es single-threaded, ninguna otra petición puede ejecutarse a
+// mitad de la transacción, así que no hay condición de carrera posible
+// aunque el jugador dispare varias peticiones de /release en paralelo:
+// se procesan una detrás de otra, cada una viendo el estado ya actualizado
+// por la anterior.
+const releasePetTx = db.transaction((licenseId, petId) => {
+  // 1. Comprobar si la mascota que se va a liberar estaba equipada.
+  const petRow = db
+    .prepare('SELECT equipped FROM player_pets WHERE pet_id = ? AND license_id = ?')
+    .get(petId, licenseId);
+
+  if (!petRow) {
+    // No debería pasar (ya se comprobó antes de llamar a la transacción),
+    // pero se protege igualmente por si otra petición la liberó primero.
+    return { released: false, reassignedPetId: null };
+  }
+
+  const wasEquipped = !!petRow.equipped;
+
+  // 2. Eliminar la mascota.
+  db.prepare('DELETE FROM player_pets WHERE pet_id = ?').run(petId);
+
+  // 3. Si no estaba equipada, no hay nada más que hacer: comportamiento
+  //    actual sin cambios.
+  if (!wasEquipped) {
+    return { released: true, reassignedPetId: null };
+  }
+
+  // 4. Estaba equipada: buscar otra mascota del jugador (excluyendo la que
+  //    acabamos de borrar) para promocionarla a equipada automáticamente.
+  //    Se ordena por created_at ASC (la más antigua primero) y pet_id como
+  //    desempate estable si dos mascotas compartieran created_at.
+  const nextPet = db
+    .prepare(
+      `SELECT pet_id FROM player_pets
+       WHERE license_id = ? AND pet_id != ?
+       ORDER BY created_at ASC, pet_id ASC
+       LIMIT 1`
+    )
+    .get(licenseId, petId);
+
+  if (!nextPet) {
+    // 5. No tiene ninguna otra mascota: se queda sin mascota equipada,
+    //    sin producir ningún error.
+    return { released: true, reassignedPetId: null };
+  }
+
+  // 6. Garantizar que solo quede una mascota equipada: desequipar
+  //    cualquier otra por seguridad (no debería haber ninguna, ya que la
+  //    equipada era la que se acaba de borrar) y luego marcar la nueva.
+  db.prepare('UPDATE player_pets SET equipped = 0 WHERE license_id = ?').run(licenseId);
+  db.prepare('UPDATE player_pets SET equipped = 1 WHERE pet_id = ?').run(nextPet.pet_id);
+
+  return { released: true, reassignedPetId: nextPet.pet_id };
+});
+
 router.post('/release', requireToken, (req, res) => {
   const petId = req.body?.petId;
   if (!petId) return res.status(400).json({ ok: false, error: 'pet_id inválido' });
@@ -171,9 +252,9 @@ router.post('/release', requireToken, (req, res) => {
     .get(petId, req.license.id);
   if (!petRow) return res.status(404).json({ ok: false, error: 'Mascota no encontrada' });
 
-  db.prepare('DELETE FROM player_pets WHERE pet_id = ?').run(petId);
+  const result = releasePetTx(req.license.id, petId);
 
-  res.json({ ok: true });
+  res.json({ ok: true, reassignedPetId: result.reassignedPetId });
 });
 
 module.exports = router;
