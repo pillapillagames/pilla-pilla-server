@@ -717,6 +717,138 @@ router.post('/claim-achievement', requireToken, (req, res) => {
   res.json({ ok: true, coins: newCoins, achievementsClaimed: claimed });
 });
 
+// --- Mismo bug de sincronización, encontrado también en: regalo de
+// bienvenida, recompensa diaria, regalos del buzón y regalo por subir de
+// nivel. Todos pagaban solo en local (player_data.gd / player_economy.gd)
+// sin avisar nunca al servidor — mismo patrón que los logros de arriba.
+try {
+  db.prepare('ALTER TABLE player_stats ADD COLUMN welcome_gift_claimed INTEGER DEFAULT 0').run();
+} catch (e) { /* columna ya existe */ }
+try {
+  db.prepare('ALTER TABLE player_stats ADD COLUMN last_daily_reward_date TEXT').run();
+} catch (e) { /* columna ya existe */ }
+try {
+  db.prepare('ALTER TABLE player_stats ADD COLUMN mailbox_gifts_claimed TEXT').run();
+} catch (e) { /* columna ya existe */ }
+
+const WELCOME_GIFT_COINS = 300; // tiene que coincidir con WELCOME_GIFT_COINS en player_data.gd
+
+// POST /api/player/claim-welcome-gift  (requiere token, sin body)
+// Un solo pago de por vida por cuenta. El servidor decide el importe
+// (WELCOME_GIFT_COINS), nunca lo que mande el cliente.
+router.post('/claim-welcome-gift', requireToken, (req, res) => {
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = db.prepare('SELECT coins, welcome_gift_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
+
+  if (stats.welcome_gift_claimed) {
+    return res.json({ ok: true, alreadyClaimed: true, coins: stats.coins });
+  }
+
+  const newCoins = stats.coins + WELCOME_GIFT_COINS;
+  db.prepare(
+    `UPDATE player_stats SET coins = ?, welcome_gift_claimed = 1, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(newCoins, req.license.id);
+
+  res.json({ ok: true, coins: newCoins });
+});
+
+const DAILY_REWARD_MIN = 10; // tiene que coincidir con DAILY_CLAIM_MIN/MAX en player_data.gd
+const DAILY_REWARD_MAX = 100;
+
+function todayUtcKey() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+// POST /api/player/claim-daily-reward  (requiere token, sin body)
+// El propio servidor tira el dado (10-100) y decide si ya tocó hoy — así no
+// hace falta fiarse de ningún importe que mande el cliente.
+router.post('/claim-daily-reward', requireToken, (req, res) => {
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = db.prepare('SELECT coins, last_daily_reward_date FROM player_stats WHERE license_id = ?').get(req.license.id);
+
+  const today = todayUtcKey();
+  if (stats.last_daily_reward_date === today) {
+    return res.json({ ok: true, alreadyClaimed: true, coins: stats.coins });
+  }
+
+  const amount = DAILY_REWARD_MIN + Math.floor(Math.random() * (DAILY_REWARD_MAX - DAILY_REWARD_MIN + 1));
+  const newCoins = stats.coins + amount;
+  db.prepare(
+    `UPDATE player_stats SET coins = ?, last_daily_reward_date = ?, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(newCoins, today, req.license.id);
+
+  res.json({ ok: true, coins: newCoins, amount });
+});
+
+const MAILBOX_COINS_MAX_PER_GIFT = 120; // tiene que coincidir con MAILBOX_COINS_MAX en player_data.gd
+
+// POST /api/player/claim-mailbox-gift  body: { giftId, amount }  (requiere token)
+// Dedupe por giftId (el cliente los genera con un contador local, así que
+// aquí solo hace falta que no se repita el mismo id dos veces); el importe
+// se acepta tal cual lo manda el cliente pero acotado al máximo real de un
+// solo regalo de monedas del buzón.
+router.post('/claim-mailbox-gift', requireToken, (req, res) => {
+  const giftId = req.body?.giftId;
+  const amount = Math.trunc(Number(req.body?.amount));
+  if (typeof giftId !== 'string' || giftId === '') {
+    return res.status(400).json({ ok: false, error: 'giftId inválido.' });
+  }
+  if (!Number.isInteger(amount) || amount <= 0 || amount > MAILBOX_COINS_MAX_PER_GIFT) {
+    return res.status(400).json({ ok: false, error: 'Cantidad de regalo de buzón inválida.' });
+  }
+
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = db.prepare('SELECT coins, mailbox_gifts_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
+  const claimed = parseJsonArray(stats.mailbox_gifts_claimed);
+
+  if (claimed.includes(giftId)) {
+    return res.json({ ok: true, alreadyClaimed: true, coins: stats.coins });
+  }
+
+  const newCoins = stats.coins + amount;
+  claimed.push(giftId);
+  // No dejamos crecer la lista sin límite: solo hace falta recordar los
+  // últimos (más que de sobra frente a MAILBOX_MAX_STORED del cliente).
+  const trimmed = claimed.slice(-200);
+
+  db.prepare(
+    `UPDATE player_stats SET coins = ?, mailbox_gifts_claimed = ?, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(newCoins, JSON.stringify(trimmed), req.license.id);
+
+  res.json({ ok: true, coins: newCoins });
+});
+
+const LEVEL_UP_GIFT_MAX_PER_CALL = 100; // tiene que coincidir con LEVEL_UP_GIFT_MAX en player_economy.gd
+const LEVEL_UP_GIFT_COOLDOWN_MS = 5 * 1000;
+const _lastLevelUpGiftAt = new Map();
+
+// POST /api/player/claim-level-up-gift  body: { amount }  (requiere token)
+// Sin id único que deduplicar (puede tocar en distintos niveles), así que
+// se defiende igual que /training-coins-earned: tope por llamada + cooldown.
+router.post('/claim-level-up-gift', requireToken, (req, res) => {
+  const now = Date.now();
+  const lastAt = _lastLevelUpGiftAt.get(req.license.id) || 0;
+  if (now - lastAt < LEVEL_UP_GIFT_COOLDOWN_MS) {
+    return res.status(429).json({ ok: false, error: 'Estás mandando regalos de nivel demasiado rápido.' });
+  }
+
+  const amount = Math.trunc(Number(req.body?.amount));
+  if (!Number.isInteger(amount) || amount <= 0 || amount > LEVEL_UP_GIFT_MAX_PER_CALL) {
+    return res.status(400).json({ ok: false, error: 'Cantidad de regalo de nivel inválida.' });
+  }
+
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  db.prepare(
+    `UPDATE player_stats SET coins = coins + ?, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(amount, req.license.id);
+
+  _lastLevelUpGiftAt.set(req.license.id, now);
+
+  const row = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
+  res.json({ ok: true, coins: row.coins });
+});
+
 const MAX_SEND_AMOUNT = 100000; // límite defensivo por envío
 
 function canSendCoins(fromId, toId) {
