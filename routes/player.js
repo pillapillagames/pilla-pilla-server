@@ -717,25 +717,120 @@ router.post('/claim-achievement', requireToken, (req, res) => {
   res.json({ ok: true, coins: newCoins, achievementsClaimed: claimed });
 });
 
-// --- Mismo bug de sincronización, encontrado también en: regalo de
-// bienvenida, recompensa diaria, regalos del buzón y regalo por subir de
-// nivel. Todos pagaban solo en local (player_data.gd / player_economy.gd)
-// sin avisar nunca al servidor — mismo patrón que los logros de arriba.
-try {
-  db.prepare('ALTER TABLE player_stats ADD COLUMN welcome_gift_claimed INTEGER DEFAULT 0').run();
-} catch (e) { /* columna ya existe */ }
-try {
-  db.prepare('ALTER TABLE player_stats ADD COLUMN last_daily_reward_date TEXT').run();
-} catch (e) { /* columna ya existe */ }
+const MAX_SEND_AMOUNT = 100000; // límite defensivo por envío
+
+// FIX (auditoría — mismo bug que ya se arregló para logros, ver comentario
+// junto a /claim-achievement arriba, pero para el Buzón de regalos):
+// claim_mailbox_gift() en el cliente (player_data.gd) solo hacía
+// "coins += g.amount" en LOCAL y guardaba, sin avisar nunca al servidor.
+// Como adoptar/entrenar mascotas y comprar muebles de la Casa SÍ validan
+// el saldo contra player_stats.coins en el servidor (ver /api/pets/adopt),
+// un jugador que reclamaba un regalo de monedas veía el número subir en
+// pantalla pero el servidor seguía sin enterarse -- así que la compra se
+// rechazaba con "No tienes suficientes monedas" aunque la UI dijera que
+// sobraban. pet_zone.gd ya reintentaba una vez tras resync_pending_coins(),
+// pero ese resync solo reenviaba logros, nunca regalos, así que el
+// reintento fallaba exactamente igual y el jugador se quedaba atascado.
+//
+// Mismo patrón que /claim-achievement: dedupe por id (columna nueva
+// mailbox_gifts_claimed, incluso si el mismo giftId llega dos veces por un
+// reintento de red no se paga dos veces) + el servidor no se fía del
+// importe que mande el cliente más allá de acotarlo al rango legítimo que
+// _add_random_mailbox_gift() puede generar (15-120, ver MAILBOX_COINS_MIN/
+// MAX en player_data.gd) -- así un JWT robado no puede usarse para
+// autoconcederse monedas infinitas llamando a este endpoint en bucle con
+// ids inventados.
 try {
   db.prepare('ALTER TABLE player_stats ADD COLUMN mailbox_gifts_claimed TEXT').run();
-} catch (e) { /* columna ya existe */ }
+} catch (e) {
+  // La columna ya existe; no es un error real, se ignora (igual que arriba).
+}
 
-const WELCOME_GIFT_COINS = 300; // tiene que coincidir con WELCOME_GIFT_COINS en player_data.gd
+const MAILBOX_GIFT_COINS_MIN = 15;  // = MAILBOX_COINS_MIN en player_data.gd
+const MAILBOX_GIFT_COINS_MAX = 120; // = MAILBOX_COINS_MAX en player_data.gd
+
+// POST /api/player/claim-mailbox-gift  body: { giftId, amount }  (requiere token)
+// Solo cubre regalos de tipo "coins" -- los de tipo "xp"/"skin" no afectan
+// al saldo que el resto de pantallas validan contra el servidor, así que
+// se quedan como estaban (solo locales, ver claim_mailbox_gift en el
+// cliente).
+router.post('/claim-mailbox-gift', requireToken, (req, res) => {
+  const giftId = (req.body?.giftId || '').toString();
+  const amount = Math.trunc(Number(req.body?.amount));
+
+  if (!giftId) {
+    return res.status(400).json({ ok: false, error: 'Regalo inválido.' });
+  }
+  if (!Number.isInteger(amount) || amount < MAILBOX_GIFT_COINS_MIN || amount > MAILBOX_GIFT_COINS_MAX) {
+    return res.status(400).json({ ok: false, error: 'Cantidad de regalo inválida.' });
+  }
+
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = db.prepare('SELECT coins, mailbox_gifts_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
+  const claimed = parseJsonArray(stats.mailbox_gifts_claimed);
+
+  if (claimed.includes(giftId)) {
+    return res.json({ ok: true, alreadyClaimed: true, coins: stats.coins });
+  }
+
+  const newCoins = stats.coins + amount;
+  claimed.push(giftId);
+
+  db.prepare(
+    `UPDATE player_stats SET coins = ?, mailbox_gifts_claimed = ?, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(newCoins, JSON.stringify(claimed), req.license.id);
+
+  res.json({ ok: true, coins: newCoins, mailboxGiftsClaimed: claimed });
+});
+
+// FIX (mismo bug, mismo patrón que el Buzón de arriba): claim_daily_reward()
+// y claim_welcome_gift() en el cliente (player_data.gd) también sumaban
+// "coins" solo en LOCAL, sin avisar nunca al servidor -- reclamar el
+// regalo diario o el de bienvenida y luego intentar adoptar una mascota o
+// comprar en la Casa se rechazaba igual que con los regalos del Buzón.
+try {
+  db.prepare('ALTER TABLE player_stats ADD COLUMN daily_claim_date TEXT').run();
+} catch (e) { /* ya existe */ }
+try {
+  db.prepare('ALTER TABLE player_stats ADD COLUMN welcome_gift_claimed INTEGER').run();
+} catch (e) { /* ya existe */ }
+
+const DAILY_CLAIM_COINS_MIN = 10;  // = DAILY_CLAIM_MIN en player_data.gd
+const DAILY_CLAIM_COINS_MAX = 100; // = DAILY_CLAIM_MAX en player_data.gd
+const WELCOME_GIFT_COINS = 300;    // = WELCOME_GIFT_COINS en player_data.gd
+
+// POST /api/player/claim-daily-reward  body: { amount }  (requiere token)
+// Dedupe por FECHA (una vez al día, igual que can_claim_daily() en el
+// cliente): si ya se reclamó hoy, se devuelve el saldo actual sin volver a
+// pagar, así que da igual si esto se llama más de una vez el mismo día
+// (reintento de red, doble tap...).
+router.post('/claim-daily-reward', requireToken, (req, res) => {
+  const amount = Math.trunc(Number(req.body?.amount));
+  if (!Number.isInteger(amount) || amount < DAILY_CLAIM_COINS_MIN || amount > DAILY_CLAIM_COINS_MAX) {
+    return res.status(400).json({ ok: false, error: 'Cantidad de regalo diario inválida.' });
+  }
+
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = db.prepare('SELECT coins, daily_claim_date FROM player_stats WHERE license_id = ?').get(req.license.id);
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD, UTC (servidor)
+
+  if (stats.daily_claim_date === today) {
+    return res.json({ ok: true, alreadyClaimed: true, coins: stats.coins });
+  }
+
+  const newCoins = stats.coins + amount;
+  db.prepare(
+    `UPDATE player_stats SET coins = ?, daily_claim_date = ?, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(newCoins, today, req.license.id);
+
+  res.json({ ok: true, coins: newCoins });
+});
 
 // POST /api/player/claim-welcome-gift  (requiere token, sin body)
-// Un solo pago de por vida por cuenta. El servidor decide el importe
-// (WELCOME_GIFT_COINS), nunca lo que mande el cliente.
+// Dedupe con un flag: una sola vez en toda la vida de la cuenta, igual que
+// welcome_gift_claimed en el cliente. El importe SIEMPRE es
+// WELCOME_GIFT_COINS -- a diferencia del Buzón/diario, este no depende de
+// nada que mande el cliente, así que no hay nada que validar del body.
 router.post('/claim-welcome-gift', requireToken, (req, res) => {
   db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
   const stats = db.prepare('SELECT coins, welcome_gift_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
@@ -752,104 +847,6 @@ router.post('/claim-welcome-gift', requireToken, (req, res) => {
   res.json({ ok: true, coins: newCoins });
 });
 
-const DAILY_REWARD_MIN = 10; // tiene que coincidir con DAILY_CLAIM_MIN/MAX en player_data.gd
-const DAILY_REWARD_MAX = 100;
-
-function todayUtcKey() {
-  const d = new Date();
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-}
-
-// POST /api/player/claim-daily-reward  (requiere token, sin body)
-// El propio servidor tira el dado (10-100) y decide si ya tocó hoy — así no
-// hace falta fiarse de ningún importe que mande el cliente.
-router.post('/claim-daily-reward', requireToken, (req, res) => {
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  const stats = db.prepare('SELECT coins, last_daily_reward_date FROM player_stats WHERE license_id = ?').get(req.license.id);
-
-  const today = todayUtcKey();
-  if (stats.last_daily_reward_date === today) {
-    return res.json({ ok: true, alreadyClaimed: true, coins: stats.coins });
-  }
-
-  const amount = DAILY_REWARD_MIN + Math.floor(Math.random() * (DAILY_REWARD_MAX - DAILY_REWARD_MIN + 1));
-  const newCoins = stats.coins + amount;
-  db.prepare(
-    `UPDATE player_stats SET coins = ?, last_daily_reward_date = ?, updated_at = datetime('now') WHERE license_id = ?`
-  ).run(newCoins, today, req.license.id);
-
-  res.json({ ok: true, coins: newCoins, amount });
-});
-
-const MAILBOX_COINS_MAX_PER_GIFT = 120; // tiene que coincidir con MAILBOX_COINS_MAX en player_data.gd
-
-// POST /api/player/claim-mailbox-gift  body: { giftId, amount }  (requiere token)
-// Dedupe por giftId (el cliente los genera con un contador local, así que
-// aquí solo hace falta que no se repita el mismo id dos veces); el importe
-// se acepta tal cual lo manda el cliente pero acotado al máximo real de un
-// solo regalo de monedas del buzón.
-router.post('/claim-mailbox-gift', requireToken, (req, res) => {
-  const giftId = req.body?.giftId;
-  const amount = Math.trunc(Number(req.body?.amount));
-  if (typeof giftId !== 'string' || giftId === '') {
-    return res.status(400).json({ ok: false, error: 'giftId inválido.' });
-  }
-  if (!Number.isInteger(amount) || amount <= 0 || amount > MAILBOX_COINS_MAX_PER_GIFT) {
-    return res.status(400).json({ ok: false, error: 'Cantidad de regalo de buzón inválida.' });
-  }
-
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  const stats = db.prepare('SELECT coins, mailbox_gifts_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
-  const claimed = parseJsonArray(stats.mailbox_gifts_claimed);
-
-  if (claimed.includes(giftId)) {
-    return res.json({ ok: true, alreadyClaimed: true, coins: stats.coins });
-  }
-
-  const newCoins = stats.coins + amount;
-  claimed.push(giftId);
-  // No dejamos crecer la lista sin límite: solo hace falta recordar los
-  // últimos (más que de sobra frente a MAILBOX_MAX_STORED del cliente).
-  const trimmed = claimed.slice(-200);
-
-  db.prepare(
-    `UPDATE player_stats SET coins = ?, mailbox_gifts_claimed = ?, updated_at = datetime('now') WHERE license_id = ?`
-  ).run(newCoins, JSON.stringify(trimmed), req.license.id);
-
-  res.json({ ok: true, coins: newCoins });
-});
-
-const LEVEL_UP_GIFT_MAX_PER_CALL = 100; // tiene que coincidir con LEVEL_UP_GIFT_MAX en player_economy.gd
-const LEVEL_UP_GIFT_COOLDOWN_MS = 5 * 1000;
-const _lastLevelUpGiftAt = new Map();
-
-// POST /api/player/claim-level-up-gift  body: { amount }  (requiere token)
-// Sin id único que deduplicar (puede tocar en distintos niveles), así que
-// se defiende igual que /training-coins-earned: tope por llamada + cooldown.
-router.post('/claim-level-up-gift', requireToken, (req, res) => {
-  const now = Date.now();
-  const lastAt = _lastLevelUpGiftAt.get(req.license.id) || 0;
-  if (now - lastAt < LEVEL_UP_GIFT_COOLDOWN_MS) {
-    return res.status(429).json({ ok: false, error: 'Estás mandando regalos de nivel demasiado rápido.' });
-  }
-
-  const amount = Math.trunc(Number(req.body?.amount));
-  if (!Number.isInteger(amount) || amount <= 0 || amount > LEVEL_UP_GIFT_MAX_PER_CALL) {
-    return res.status(400).json({ ok: false, error: 'Cantidad de regalo de nivel inválida.' });
-  }
-
-  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
-  db.prepare(
-    `UPDATE player_stats SET coins = coins + ?, updated_at = datetime('now') WHERE license_id = ?`
-  ).run(amount, req.license.id);
-
-  _lastLevelUpGiftAt.set(req.license.id, now);
-
-  const row = db.prepare('SELECT coins FROM player_stats WHERE license_id = ?').get(req.license.id);
-  res.json({ ok: true, coins: row.coins });
-});
-
-const MAX_SEND_AMOUNT = 100000; // límite defensivo por envío
 
 function canSendCoins(fromId, toId) {
   const friend = db
