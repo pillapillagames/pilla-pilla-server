@@ -80,26 +80,36 @@ function parseUnlockedSkins(raw) {
 // (el cliente solo las usa para pintar la pantalla; el servidor es quien
 // manda de verdad sobre si se puede reclamar y qué se da).
 const BATTLE_PASS_XP_PER_TIER = 150;
+// FIX (pendiente): estos "furniture" están reflejados aquí solo para que
+// tabla no se desincronice de scripts/player_progression.gd (mismo criterio
+// que coins/skin), pero /claim-battlepass-tier de más abajo TODAVÍA NO los
+// concede: no existe columna battle_pass_premium en player_stats (el
+// endpoint POST /api/player/buy-battlepass tampoco está implementado, ver
+// nota en scripts/server_sync.gd::buy_battle_pass) así que el servidor no
+// tiene forma de saber si la cuenta tiene Premium. Hasta que se añada esa
+// columna + el endpoint de compra, el mueble solo se regala en el reclamo
+// LOCAL (sin token, ver PlayerProgression.claim_battle_pass_tier), igual
+// que ya pasaba con el multiplicador x2 de monedas Premium.
 const BATTLE_PASS_TIERS = [
   { coins: 20 },
   { coins: 20 },
   { coins: 30 },
-  { coins: 30 },
+  { coins: 30, furniture: 'lampara' },      // Lámpara de pie
   { coins: 50, skin: 1 },   // Lava
   { coins: 30 },
   { coins: 30 },
   { coins: 40 },
-  { coins: 40 },
+  { coins: 40, furniture: 'estanteria' },   // Estantería
   { coins: 80, skin: 2 },   // Esmeralda
   { coins: 40 },
   { coins: 40 },
   { coins: 50 },
-  { coins: 50 },
+  { coins: 50, furniture: 'cama' },         // Cama
   { coins: 100, skin: 3 },  // Oro
   { coins: 50 },
   { coins: 50 },
   { coins: 60 },
-  { coins: 60 },
+  { coins: 60, furniture: 'sofa_lujo' },    // Sofá de lujo
   { coins: 150, skin: 4 },  // Fantasma (gran premio final)
 ];
 
@@ -653,6 +663,58 @@ router.post('/claim-tournament-milestone', requireToken, (req, res) => {
   ).run(newCoins, JSON.stringify(unlocked), JSON.stringify(claimed), req.license.id);
 
   res.json({ ok: true, coins: newCoins, unlockedSkins: unlocked, tournamentClaimed: claimed });
+});
+
+// --- Logros (FIX: monedas de logros desincronizadas con el servidor) ---
+//
+// PROBLEMA: PlayerAchievements.check_new() (cliente) pagaba la recompensa de
+// cada logro sumando directamente a PlayerData.coins en local, sin avisar
+// nunca al servidor. Como la Zona de Mascotas/Casas leen y pisan
+// PlayerData.coins con el saldo AUTORITATIVO que vive en player_stats.coins
+// (ver GET /api/player/pets, /api/player/house), un jugador con logros
+// desbloqueados veía un número en el mundo principal (p.ej. 300, con los
+// premios de logros incluidos) y otro distinto — más bajo — nada más entrar
+// en esas zonas (p.ej. 40, sin los logros), porque el servidor nunca se
+// había enterado de esas monedas.
+//
+// FIX: igual que /claim-battlepass-tier y /claim-tournament-milestone, cada
+// logro se reclama aquí UNA sola vez (dedupe por id en la nueva columna
+// player_stats.achievements_claimed) y el servidor decide cuánto se paga
+// mirando su propio catálogo (achievementCatalog.js), no lo que mande el
+// cliente. Así el saldo del servidor deja de quedarse atrás.
+try {
+  db.prepare('ALTER TABLE player_stats ADD COLUMN achievements_claimed TEXT').run();
+} catch (e) {
+  // La columna ya existe (better-sqlite3 lanza aquí si el ALTER se repite
+  // en un arranque posterior); no es un error real, se ignora.
+}
+
+const { ACHIEVEMENT_COINS } = require('../data/achievementCatalog');
+
+// POST /api/player/claim-achievement  body: { achievementId }  (requiere token)
+router.post('/claim-achievement', requireToken, (req, res) => {
+  const achievementId = req.body?.achievementId;
+  if (typeof achievementId !== 'string' || !(achievementId in ACHIEVEMENT_COINS)) {
+    return res.status(400).json({ ok: false, error: 'Logro desconocido.' });
+  }
+
+  db.prepare('INSERT OR IGNORE INTO player_stats (license_id) VALUES (?)').run(req.license.id);
+  const stats = db.prepare('SELECT coins, achievements_claimed FROM player_stats WHERE license_id = ?').get(req.license.id);
+  const claimed = parseJsonArray(stats.achievements_claimed);
+
+  if (claimed.includes(achievementId)) {
+    return res.json({ ok: true, alreadyClaimed: true, coins: stats.coins });
+  }
+
+  const reward = ACHIEVEMENT_COINS[achievementId];
+  const newCoins = stats.coins + reward;
+  claimed.push(achievementId);
+
+  db.prepare(
+    `UPDATE player_stats SET coins = ?, achievements_claimed = ?, updated_at = datetime('now') WHERE license_id = ?`
+  ).run(newCoins, JSON.stringify(claimed), req.license.id);
+
+  res.json({ ok: true, coins: newCoins, achievementsClaimed: claimed });
 });
 
 const MAX_SEND_AMOUNT = 100000; // límite defensivo por envío
